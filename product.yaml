@@ -485,7 +485,7 @@ Resources:
   GHARunnerGroupLambda:
     Type: AWS::Lambda::Function
     Properties:
-      Handler: gharunnergroup.handler
+      Handler: gha_runnergroup.index.lambda_handler
       Role: !GetAtt GHARunnerGroupRole.Arn
       Code:
         S3Bucket: !Ref LambdaS3Bucket
