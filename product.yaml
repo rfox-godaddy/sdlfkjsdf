@@ -1,0 +1,813 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: GitHub Actions Self Hosted Runner using Autoscaling groups and EC2
+Parameters:
+  RunnerName:
+    Type: String
+    Description: Unique name for the Runner Autoscaling group.
+  GitHubOrganization:
+    Type: String
+    Description: The organization containing the repository, f. ex. gdcorp-cp
+  GitHubRepository:
+    Type: String
+    Description: The repository to register the GitHub Actions Runner to. Required when IsOrgRunner is false. Example global-tech-registry-lambdas.
+    Default: ""
+  IsOrgRunner:
+    Type: String
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+    Description: Flag to create org runner with a group instead of repository runner.
+  RunnerGroupName:
+    Type: String
+    AllowedPattern: "^(?!Default$).*$"
+    Default: ""
+    Description: Name of runner group for org runner. Default group is not allowed. Required when IsOrgRunner is true.
+  RunnerGroupRepositories:
+    Type: String
+    Default: ""
+    Description: Comma separated list of repositories the organization scoped runner group is permitted to service. Required when IsOrgRunner is true.
+  RunnerAutoScalingGroupSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of Subnets for the instances
+  RunnerLabels:
+    Type: String
+    Description: Comma separated list of labels to attach to the Runner in addition to the default ones.
+    Default: ec2
+  GitHubSecretName:
+    Type: String
+    Description: "Name of the AWS Secrets Manager secret containing 2 keys:
+      1. PAT - personal access token to register GitHub Actions Runner.
+      2. WEBHOOK_SECRET - webhook secret for webhook to receive 'Workflow jobs' events."
+    Default: /GitHub/GitHub-Actions-Runner-Secret
+    AllowedPattern: "/GitHub.*"
+  ScheduleExpression:
+    Type: String
+    Description: CRON or Rate Schedule for when attempt to scale down the autoscaling group based on TimeToLiveActive and TimeToLiveRotation.
+    Default: "rate(30 minutes)"
+  TimeToLiveActive:
+    Type: Number
+    Description: Number of seconds to keep active instance before trying to delete it and scale down the auto scaling group.
+    Default: 3600
+  TimeToLiveRotation:
+    Type: Number
+    Description: Number of seconds to keep instance before attempting to terminating it. It will terminate stopped and running instance (non busy runners) and basically accomplish instance rotation.
+    Default: 43200
+  RunnerAutoScalingGroupDesiredSize:
+    Default: 1
+    Description: The desired capacity for the instances in the runner autoscaling group
+    Type: Number
+  RunnerAutoScalingGroupMaxSize:
+    Default: 20
+    Description: The maximum number of instances in the runner autoscaling group
+    Type: Number
+  RunnerAutoScalingGroupMinSize:
+    Default: 0
+    Description: The minimum number of instances in the runner autoscaling group
+    Type: Number
+  RunnerAutoScalingGroupWarmPoolSize:
+    Default: 1
+    Description: The minimum number of instances to keep in the warm pool
+    Type: Number
+  RunnerVersion:
+    Type: String
+    Description: Runner version
+    Default: "2.288.1"
+  RunnerVolumeSize:
+    Type: Number
+    Description: Size of Runner volumes in GB between 10 and 200.
+    Default: 20
+    MinValue: 10
+    MaxValue: 200
+  RunnerAMIId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Description: SSM Parameter for GAMI
+    Default: /GoldenAMI/gd-amzn2/latest
+    AllowedPattern: "/GoldenAMI/gd-(ubuntu|amzn2).+"
+  RunnerInstanceType:
+    Description: EC2 instance type for the instances.
+    Type: String
+    Default: t3.small
+  RunnerVolumeType:
+    Description: EC2 volume type for the instances.
+    Type: String
+    Default: gp3
+  RunnerVolumeIOPS:
+    Description: Max IOPS per volume. Optional for gp3, required for io2 and io1, forbidden for st1 and sc1.
+    Type: Number
+    Default: 3000
+  DevelopmentTeam:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: SSM Parameter for team owning the created resources. (Lowercase)
+    Default: /AdminParams/Team/Name
+    AllowedValues:
+      - /AdminParams/Team/Name
+  DevelopmentEnvironment:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: SSM Parameter for team development environment
+    Default: /AdminParams/Team/Environment
+    AllowedValues:
+      - /AdminParams/Team/Environment
+  VPC:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::VPC::Id>
+    Description: SSM Parameter for VPC ID for the group
+    Default: /AdminParams/VPC/ID
+    AllowedPattern: "/AdminParams/VPC.*/ID"
+  LambdaS3Bucket:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: SSM parameter referencing the S3 Bucket which contains the Lambda code.
+    Default: /AdminParams/Team/GlobalBucket
+    AllowedValues:
+      - /AdminParams/Team/GlobalBucket
+      - /Team/S3/DevBucket
+  CustomUserData:
+    Type: String
+    Description: (optional) Additional tools to install on the runner before marking it as available (for instance pyenv or other) Please insert as a single line using && as separators.
+    Default: ""
+  CustomPreInitData:
+    Type: String
+    Description: (optional) Additional shell commands to run prior to starting the docker service (useful if you want to mount the docker folder onto an onboard SSD on a "d" instance type)
+    Default: ""
+  DeviceName:
+    Type: String
+    Description: (optional) Root volume mount device name. See https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/device_naming.html
+    Default: /dev/xvda
+    AllowedValues:
+      - /dev/xvda
+      - /dev/sda1
+  UseCICDRole:
+    Type: String
+    Description: Specifies if you are using CICDRole. Set this to "true" if you want this runner to deploy into your dev/test/prod/etc. accounts.
+    Default: false
+    AllowedValues:
+      - false
+      - true
+  RolePrefix:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: SSM Parameter for role names prefix
+    Default: /AdminParams/Role/RolePrefix
+    AllowedValues:
+      - /AdminParams/Role/RolePrefix
+  BusinessUnit:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: Business Unit of the Account.
+    Default: /AdminParams/Team/ProductOU
+    AllowedValues:
+      - /AdminParams/Team/ProductOU
+  ApiGatewayStageName:
+    Description: Api Gateway Stage Name
+    Type: String
+    AllowedPattern: "[a-z0-9]+"
+    Default: call
+
+Conditions:
+  UsingCICDRole: !Not [ !Equals [ !Ref UseCICDRole, "false" ] ]
+  UsingIOPS: !Or [ !Equals [!Ref RunnerVolumeType, "gp3"], !Equals [!Ref RunnerVolumeType, "io2"], !Equals [!Ref RunnerVolumeType, "io1"]]
+Resources:
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Name: !Sub ${RunnerName}-api-gateway
+  ApiGatewayRootMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations
+          - lambdaArn: !GetAtt WebhookLambda.Arn
+      ResourceId: !GetAtt ApiGateway.RootResourceId
+      RestApiId: !Ref ApiGateway
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: !Ref ApiGatewayStageName
+    DependsOn:
+      - ApiGatewayRootMethod
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt WebhookLambda.Arn
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/${ApiGatewayStageName}/POST/
+      Principal: apigateway.amazonaws.com
+  WebhookLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: handlers/webhook.handler
+      Role: !GetAtt WebhookLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: github_actions/gha_autoscaler/gha_autoscaler-1.2.0.zip
+      Runtime: nodejs14.x
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          RUNNER_LABELS: !Ref RunnerLabels
+          GITHUB_SECRET_NAME: !Ref GitHubSecretName
+          IS_ORG_RUNNER: !Ref IsOrgRunner
+          GITHUB_RUNNER_GROUP_NAME: !Ref RunnerGroupName
+          GITHUB_REPO_ORG: !Ref GitHubOrganization
+          GITHUB_REPO_NAME: !Ref GitHubRepository
+          SCALE_UP_STREAM: !Ref ScaleUpLambdaStream
+      TracingConfig:
+        Mode: Active
+  WebhookLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/${LambdaName}"
+        - { LambdaName: !Ref WebhookLambda}
+      RetentionInDays: 14
+  WebhookLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+      Policies:
+        - PolicyName: !Sub WebhookLambdaRolePolicy${RunnerName}
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetResourcePolicy
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:ListSecretVersionIds
+                Resource:
+                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GitHubSecretName}-*
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                Resource: !GetAtt ScaleUpLambdaStream.Arn
+  ScaleUpLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: handlers/scale-up.handler
+      Role: !GetAtt ScaleUpLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: github_actions/gha_autoscaler/gha_autoscaler-1.2.0.zip
+      Runtime: nodejs14.x
+      Timeout: 60
+      MemorySize: 128
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          AUTOSCALING_GROUP_NAME: !Sub gha-runner-${RunnerName}-asg
+          RUNNER_LABELS: !Ref RunnerLabels
+          IS_ORG_RUNNER: !Ref IsOrgRunner
+          GITHUB_RUNNER_GROUP_NAME: !Ref RunnerGroupName
+          GITHUB_SECRET_NAME: !Ref GitHubSecretName
+          GITHUB_REPO_ORG: !Ref GitHubOrganization
+          GITHUB_REPO_NAME: !Ref GitHubRepository
+      TracingConfig:
+        Mode: Active
+  ScaleUpLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/${LambdaName}"
+        - { LambdaName: !Ref ScaleUpLambda}
+      RetentionInDays: 14
+  ScaleUpLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+      Policies:
+        - PolicyName: !Sub WebhookLambdaRolePolicy${RunnerName}
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetResourcePolicy
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:ListSecretVersionIds
+                Resource:
+                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GitHubSecretName}-*
+              - Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:SetDesiredCapacity
+                  - autoscaling:TerminateInstanceInAutoScalingGroup
+                Resource: !Sub arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/gha-runner-${RunnerName}-asg
+  ScaleUpLambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10000 # setting to max value since relying on MaximumBatchingWindowInSeconds
+      MaximumBatchingWindowInSeconds: 10
+      MaximumRecordAgeInSeconds: 600
+      MaximumRetryAttempts: 0
+      EventSourceArn: !GetAtt ScaleUpLambdaStream.Arn
+      FunctionName: !GetAtt ScaleUpLambda.Arn
+      StartingPosition: TRIM_HORIZON
+  ScaleUpLambdaStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+        ShardCount: 1
+  ScaleDownLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: handlers/scale-down.handler
+      Role: !GetAtt ScaleDownLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: github_actions/gha_autoscaler/gha_autoscaler-1.2.0.zip
+      Runtime: nodejs14.x
+      Timeout: 60
+      MemorySize: 128
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          AUTOSCALING_GROUP_NAME: !Sub gha-runner-${RunnerName}-asg
+          RUNNER_LABELS: !Ref RunnerLabels
+          ACTIVE_INSTANCE_TTL: !Ref TimeToLiveActive
+          ROTATION_INSTANCE_TTL: !Ref TimeToLiveRotation
+          GITHUB_SECRET_NAME: !Ref GitHubSecretName
+          GITHUB_REPO_ORG: !Ref GitHubOrganization
+          GITHUB_REPO_NAME: !Ref GitHubRepository
+          IS_ORG_RUNNER: !Ref IsOrgRunner
+          GITHUB_RUNNER_GROUP_NAME: !Ref RunnerGroupName
+      TracingConfig:
+        Mode: Active
+  ScaleDownLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/${LambdaName}"
+        - { LambdaName: !Ref ScaleDownLambda}
+      RetentionInDays: 14
+  ScaleDownLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+      Policies:
+        - PolicyName: !Sub WebhookLambdaRolePolicy${RunnerName}
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetResourcePolicy
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:ListSecretVersionIds
+                Resource:
+                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GitHubSecretName}-*
+              - Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:SetDesiredCapacity
+                  - autoscaling:TerminateInstanceInAutoScalingGroup
+                Resource: !Sub arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/gha-runner-${RunnerName}-asg
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:TerminateInstances
+                Resource: "*"
+                Condition:
+                  StringLike:
+                    ec2:ResourceTag/aws:autoscaling:groupName: !Sub gha-runner-${RunnerName}-asg
+  ScaleDownLambdaEventSource:
+    Type: AWS::Events::Rule
+    Properties:
+      Targets:
+        - Arn: !GetAtt ScaleDownLambda.Arn
+          Id: target
+      ScheduleExpression: !Ref ScheduleExpression
+  ScaleDownLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt ScaleDownLambda.Arn
+      SourceArn: !GetAtt ScaleDownLambdaEventSource.Arn
+      Principal: events.amazonaws.com
+  RegistrationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: handlers/registration.handler
+      Role: !GetAtt RegistrationLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: github_actions/gha_autoscaler/gha_autoscaler-1.2.0.zip
+      Runtime: nodejs14.x
+      Timeout: 300
+      MemorySize: 128
+      Environment:
+        Variables:
+          RUNNER_LABELS: !Ref RunnerLabels
+          AUTOSCALING_GROUP_NAME: !Sub gha-runner-${RunnerName}-asg
+          GITHUB_SECRET_NAME: !Ref GitHubSecretName
+          GITHUB_REPO_ORG: !Ref GitHubOrganization
+          GITHUB_REPO_NAME: !Ref GitHubRepository
+          IS_ORG_RUNNER: !Ref IsOrgRunner
+          GITHUB_RUNNER_GROUP_NAME: !Ref RunnerGroupName
+          GITHUB_RUNNER_GROUP_REPOS: !Ref RunnerGroupRepositories
+      TracingConfig:
+        Mode: Active
+  RegistrationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/${LambdaName}"
+        - { LambdaName: !Ref RegistrationLambda}
+      RetentionInDays: 14
+  RegistrationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+      Policies:
+        - PolicyName: !Sub RegistrationLambdaRolePolicy${RunnerName}
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetResourcePolicy
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:ListSecretVersionIds
+                Resource:
+                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GitHubSecretName}-*
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                Resource: "*"
+                Condition:
+                  StringLike:
+                    ec2:ResourceTag/aws:autoscaling:groupName: !Sub gha-runner-${RunnerName}-asg
+  GHARunnerGroupLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: handlers/gharunnergroup.handler
+      Role: !GetAtt GHARunnerGroupRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: github_actions/gha_runnergroup/gha_runnergroup-1.0.0.zip
+      Runtime: python3.7
+      Timeout: 300
+      MemorySize: 128
+      Environment:
+        Variables:
+          GITHUB_SECRET_NAME: !Ref GitHubSecretName
+          GITHUB_REPO_ORG: !Ref GitHubOrganization
+          IS_ORG_RUNNER: !Ref IsOrgRunner
+          GITHUB_RUNNER_GROUP_NAME: !Ref RunnerGroupName
+          GITHUB_RUNNER_GROUP_REPOS: !Ref RunnerGroupRepositories
+      TracingConfig:
+        Mode: Active
+  GHARunnerGroupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/${LambdaName}"
+        - { LambdaName: !Ref GHARunnerGroupLambda}
+      RetentionInDays: 14
+  GHARunnerGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+      Policies:
+        - PolicyName: !Sub GHARunnerGroupLambdaRolePolicy${RunnerGroupName}
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetResourcePolicy
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:ListSecretVersionIds
+                Resource:
+                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GitHubSecretName}-*
+  ScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+        - PolicyName: AllowEC2AccessPATSecrets
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt RegistrationLambda.Arn
+              - Effect: Allow
+                Action:
+                  - autoscaling:CompleteLifecycleAction
+                  - autoscaling:SetInstanceHealth
+                Resource:
+                  - !Sub arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/gha-runner-${RunnerName}-asg
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:aws:iam::${AWS::AccountId}:policy/DenyBaselineResourceAccessPolicy
+        - !Sub arn:aws:iam::${AWS::AccountId}:policy/DenyElevatedPrivilegesPolicy
+        - !Sub arn:aws:iam::${AWS::AccountId}:policy/AllowResourcesAccessToCloudWatchPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  RunnerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - Fn::If:
+          - UsingCICDRole
+          - !Sub ${RolePrefix}-${BusinessUnit}-CICD
+          - !Ref ScalingRole
+    DependsOn:
+      - ScalingRole
+  GitHubRunnerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Deny all inbound access. Allow all outbound access.
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub secgroup-gharunner-${RunnerName}
+      SecurityGroupEgress:
+      - Description: Allow all traffic TO all IPv4 addresses
+        IpProtocol: '-1'
+        CidrIp: 0.0.0.0/0
+  RunnerAutoscalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub gha-runner-${RunnerName}-asg
+      Cooldown: "0"
+      DesiredCapacity: !Ref RunnerAutoScalingGroupDesiredSize
+      LaunchTemplate:
+        LaunchTemplateId: !Ref RunnerLaunchTemplate
+        Version:
+          Fn::GetAtt:
+          - RunnerLaunchTemplate
+          - LatestVersionNumber
+      MaxSize: !Ref RunnerAutoScalingGroupMaxSize
+      MinSize: !Ref RunnerAutoScalingGroupMinSize
+      VPCZoneIdentifier: !Ref RunnerAutoScalingGroupSubnets
+      Tags:
+        - Key: Name
+          Value: !Sub gha-runner-${RunnerName}
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: 0
+    UpdatePolicy:
+      AutoScalingScheduledAction:
+        IgnoreUnmodifiedGroupSizeProperties: true
+      AutoScalingRollingUpdate:
+        WaitOnResourceSignals: false
+        MaxBatchSize: !Ref RunnerAutoScalingGroupMaxSize
+    DependsOn:
+      - RegistrationLambda
+  RunnerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        BlockDeviceMappings:
+        - Fn::If:
+          - UsingIOPS
+          -
+            DeviceName: !Ref DeviceName
+            Ebs:
+              VolumeSize: !Ref RunnerVolumeSize
+              VolumeType: !Ref RunnerVolumeType
+              Iops: !Ref RunnerVolumeIOPS
+          -
+            DeviceName: !Ref DeviceName
+            Ebs:
+              VolumeSize: !Ref RunnerVolumeSize
+              VolumeType: !Ref RunnerVolumeType
+        IamInstanceProfile:
+          Name: !Ref RunnerInstanceProfile
+        ImageId: !Ref RunnerAMIId
+        SecurityGroupIds:
+        - !Ref GitHubRunnerSecurityGroup
+        InstanceType: !Ref RunnerInstanceType
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+              - |
+                Content-Type: multipart/mixed; boundary="//"
+                MIME-Version: 1.0
+
+                --//
+                Content-Type: text/cloud-config; charset="us-ascii"
+                MIME-Version: 1.0
+                Content-Transfer-Encoding: 7bit
+                Content-Disposition: attachment; filename="cloud-config.txt"
+
+                #cloud-config
+                cloud_final_modules:
+                - [scripts-user, always]
+
+                --//
+                Content-Type: text/x-shellscript; charset="us-ascii"
+                MIME-Version: 1.0
+                Content-Transfer-Encoding: 7bit
+                Content-Disposition: attachment; filename="userdata.txt"
+
+                #!/bin/bash
+
+                set +x
+
+                echo "GD_SYS_LOGS_STREAM=gd-${DevelopmentTeam}-${DevelopmentEnvironment}-sys-logs-stream" >> /etc/environment
+                echo "AWS_REGION=${AWS::Region}" >> /etc/environment
+
+                INSTANCE_ID=`curl http://instance-data/latest/meta-data/instance-id`
+                WORK_FOLDER=/var/github-actions/_work
+                INSTALL_FOLDER=/usr/local/bin/actions-runner
+
+                start_gha_service () {
+                  cd $INSTALL_FOLDER
+                  cli_path=`which aws`
+                  rm_path=`which rm`
+                  echo "configuring and starting Github Actions Runner service"
+                  su github-actions sh -c "./config.sh $configCmdFlags --unattended --work _work --ephemeral"
+                  ./svc.sh install github-actions
+                  mkdir -p /etc/systemd/system/$(cat .service).d
+                  cat > /etc/systemd/system/$(cat .service).d/override.conf <<-EOF
+                  [Service]
+                  ExecStop=$rm_path -rf /home/github-actions/.aws
+                  ExecStop=$cli_path autoscaling set-instance-health --region ${AWS::Region} --instance-id $INSTANCE_ID --health-status Unhealthy
+                EOF
+                  systemctl daemon-reload
+                  ./svc.sh start && ./svc.sh status
+                }
+
+                if [ ! -e "/etc/installed_packages_true" ]; then
+                  mkdir -p /etc/awslogs
+
+                  agentconfig=`aws ssm get-parameters --region ${AWS::Region} --names "/AdminParams/CloudWatch/AgentConfig"`
+                  echo $agentconfig | jq -r .Parameters[].Value > /etc/awslogs/awslogs.conf
+                  chmod 444 /etc/awslogs/awslogs.conf
+                  chown root:root /etc/awslogs/awslogs.conf
+                  /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/etc/awslogs/awslogs.conf -s || error_exit "Failed to run CloudWatch Logs agent setup"
+                  # Configure GitHub Actions Runner
+                  # Yum based
+                  if command -v yum &> /dev/null
+                  then
+                    yum install docker gcc gcc-c++ zlib-devel bzip2 bzip2-devel readline-devel sqlite sqlite-devel openssl-devel tk-devel libffi-devel -y
+                  fi
+                  # Ubuntu based
+                  if command -v apt-get &> /dev/null
+                  then
+                    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+                      echo -en "\rWaiting APT Frontend to be ready..."
+                      sleep 1
+                    done;
+                    apt-get update
+                    apt-get install docker.io build-essential zlib1g bzip2 libreadline6-dev sqlite3 libsqlite3-dev libssl-dev tk-dev libffi-dev -y
+                    chmod 666 /var/run/docker.sock
+                  fi
+                  groupadd -g 9999 github-actions
+                  useradd -g 9999 -m -N -u 9999 github-actions
+                  usermod -aG docker github-actions
+                  cat >> /etc/sudoers << EOF
+                  # Restrict sudo actions for github-actions user to installing packages using yum or apt-get
+                  github-actions  ALL = NOPASSWD: /bin/yum
+                  github-actions  ALL = NOPASSWD: /usr/bin/apt-get
+                EOF
+                  # Optional Pre initialization data before docker service
+                  ${CustomPreInitData}
+                  service docker start
+                  systemctl enable docker.service
+                  mkdir -p $WORK_FOLDER
+                  chown -R github-actions:github-actions $WORK_FOLDER
+                  mkdir $INSTALL_FOLDER && cd $INSTALL_FOLDER
+                  curl -O -L https://github.com/actions/runner/releases/download/v${RunnerVersion}/actions-runner-linux-x64-${RunnerVersion}.tar.gz
+                  tar xzf ./actions-runner-linux-x64-${RunnerVersion}.tar.gz
+                  chown -R github-actions:github-actions $INSTALL_FOLDER
+                  # Installing extra packages from Custom User Data
+                  ${CustomUserData}
+                  # Done installing extra tools
+                  touch /etc/installed_packages_true
+                fi
+
+                #Enable Security Logs
+                echo -e "@include security/security-actions.conf\n$(cat /etc/td-agent-bit/td-agent-bit.conf)" > /etc/td-agent-bit/td-agent-bit.conf
+                mkdir -p /etc/td-agent-bit/security
+                touch /etc/td-agent-bit/security/security-actions.conf
+                cat <<'EOF' >/etc/td-agent-bit/security/security-actions.conf
+                [INPUT]
+                    Name tail
+                    Path /usr/local/bin/actions-runner/_diag/*
+                    DB /opt/td-agent-bit/security-gha.db
+                    Path_Key filename
+                    Tag security-gha
+                [FILTER]
+                    Name record_modifier
+                    Match security-gha
+                    Record hostname ${!HOSTNAME}
+                    Record name gha
+                [FILTER]
+                    Name nest
+                    Match security-gha
+                    Operation nest
+                    Wildcard name
+                    Nest_under service
+                [FILTER]
+                    Name rewrite_tag
+                    Match security-gha
+                    Rule $log .* security false
+                EOF
+
+                getRegTokenCmd="sudo aws lambda invoke --region ${AWS::Region} --function-name ${RegistrationLambdaArn}"
+                registrationResponse=`$getRegTokenCmd --payload '{ "instanceId": "'$INSTANCE_ID'" }' /dev/stdout` \
+                || registrationResponse=`$getRegTokenCmd --payload '{ "instanceId": "'$INSTANCE_ID'" }' /dev/stdout --cli-binary-format raw-in-base64-out`
+                echo $registrationResponse
+                configCmdFlags=$(echo $registrationResponse | jq -r '.configCmdFlags' | head -n 1)
+                isWarmPoolInstance=$(echo $registrationResponse | jq -r '.isWarmPoolInstance' | head -n 1)
+
+                if [ "$isWarmPoolInstance" == "false" ]; then
+                    start_gha_service
+                fi
+
+                aws autoscaling complete-lifecycle-action --lifecycle-action-result CONTINUE --instance-id $INSTANCE_ID --lifecycle-hook-name ${InstallHookName} --auto-scaling-group-name ${AutoScalingGroupName} --region ${AWS::Region} || \
+                aws autoscaling complete-lifecycle-action --lifecycle-action-result ABANDON --instance-id $INSTANCE_ID --lifecycle-hook-name ${InstallHookName} --auto-scaling-group-name ${AutoScalingGroupName} --region ${AWS::Region}
+                --//--
+              - AutoScalingGroupName: !Sub gha-runner-${RunnerName}-asg
+                InstallHookName: !Sub gha-runner-${RunnerName}-install-hook
+                RegistrationLambdaArn: !GetAtt RegistrationLambda.Arn
+
+      LaunchTemplateName: !Sub gha-runner-${RunnerName}-launch-template
+    DependsOn:
+      - RunnerInstanceProfile
+  InstallLifecycleHook:
+    Type: AWS::AutoScaling::LifecycleHook
+    Properties:
+      LifecycleHookName: !Sub gha-runner-${RunnerName}-install-hook
+      AutoScalingGroupName: !Ref RunnerAutoscalingGroup
+      DefaultResult: ABANDON
+      HeartbeatTimeout: 300
+      LifecycleTransition: "autoscaling:EC2_INSTANCE_LAUNCHING"
+  WarmPool:
+    Type: AWS::AutoScaling::WarmPool
+    Properties:
+      AutoScalingGroupName: !Ref RunnerAutoscalingGroup
+      MaxGroupPreparedCapacity: !Ref RunnerAutoScalingGroupWarmPoolSize
+      MinSize: !Ref RunnerAutoScalingGroupWarmPoolSize
+
+Outputs:
+  WebhookUrl:
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${ApiGatewayStageName}
