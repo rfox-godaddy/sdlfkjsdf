@@ -489,7 +489,7 @@ Resources:
       Role: !GetAtt GHARunnerGroupRole.Arn
       Code:
         S3Bucket: !Ref LambdaS3Bucket
-        S3Key: github_actions/gha_runnergroup/gha_runnergroup-1.0.0.zip
+        S3Key: github_actions/gha_runnergroup/gha_runnergroup-1.0.1.zip
       Runtime: python3.7
       Timeout: 300
       MemorySize: 128
