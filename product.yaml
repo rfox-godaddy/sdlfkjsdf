@@ -535,6 +535,12 @@ Resources:
                   - secretsmanager:ListSecretVersionIds
                 Resource:
                   - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GitHubSecretName}-*
+   GHARunnerGroupManage:
+    Type: Custom::GHARunnerGroupManage
+    Properties:
+      ServiceToken: !GetAtt GHARunnerGroupLambda.Arn
+    DependsOn:
+      - GHARunnerGroupLambda
   ScalingRole:
     Type: AWS::IAM::Role
     Properties:
